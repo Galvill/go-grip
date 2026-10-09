@@ -60,7 +60,7 @@ func (f *fakeSource) calls() (added, removed []string) {
 func runHub(t *testing.T) (*Hub, *fakeSource) {
 	t.Helper()
 	src := newFakeSource()
-	hub := NewHub(src, testDebounce)
+	hub := NewHub(src, testDebounce, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -166,7 +166,7 @@ func TestHubDirEvents(t *testing.T) {
 func TestHubDebounce(t *testing.T) {
 	t.Parallel()
 	src := newFakeSource()
-	hub := NewHub(src, 100*time.Millisecond)
+	hub := NewHub(src, 100*time.Millisecond, nil)
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 	go hub.Run(ctx)
@@ -215,7 +215,7 @@ func TestHubAddErrorStillSubscribes(t *testing.T) {
 	t.Parallel()
 	src := newFakeSource()
 	src.addErr = errors.New("no space left on device")
-	hub := NewHub(src, testDebounce)
+	hub := NewHub(src, testDebounce, nil)
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 	go hub.Run(ctx)
@@ -245,7 +245,7 @@ func TestHubFsnotifyAtomicSave(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = src.w.Close() })
 
-	hub := NewHub(src, testDebounce)
+	hub := NewHub(src, testDebounce, nil)
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 	go hub.Run(ctx)

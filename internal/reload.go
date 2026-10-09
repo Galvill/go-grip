@@ -2,10 +2,11 @@ package internal
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -15,6 +16,7 @@ import (
 type WatchSet struct {
 	Files []string // absolute OS paths; any event on them matches
 	Dirs  []string // absolute OS paths; any non-temp event on a direct child matches
+	Page  string   // the page's URL path; used in log lines only
 }
 
 // EventSource is a non-recursive folder watcher. *fsnotify.Watcher is
@@ -51,6 +53,8 @@ func (s *fsnotifySource) Errors() <-chan error          { return s.w.Errors }
 type Hub struct {
 	src      EventSource
 	debounce time.Duration
+	log      *slog.Logger
+	nextID   atomic.Uint64
 
 	// watchMu serializes folder reference counting and the matching
 	// src.Add/src.Remove calls. It is never held together with mu.
@@ -63,21 +67,26 @@ type Hub struct {
 }
 
 type subscriber struct {
+	id      uint64
+	page    string
 	files   map[string]bool
 	dirs    map[string]bool
 	folders []string
 	notify  chan struct{}
 
 	// Guarded by Hub.mu.
-	timer *time.Timer
-	gen   uint64
+	timer   *time.Timer
+	gen     uint64
+	pending int // events coalesced into the next fire
 }
 
 // NewHub returns a hub reading from src. Call Run to start processing events.
-func NewHub(src EventSource, debounce time.Duration) *Hub {
+// A nil logger discards all output.
+func NewHub(src EventSource, debounce time.Duration, logger *slog.Logger) *Hub {
 	return &Hub{
 		src:      src,
 		debounce: debounce,
+		log:      orDiscard(logger),
 		refs:     make(map[string]int),
 		failed:   make(map[string]bool),
 		subs:     make(map[*subscriber]struct{}),
@@ -102,7 +111,7 @@ func (h *Hub) Run(ctx context.Context) {
 				errs = nil
 				continue
 			}
-			log.Printf("❌ file watcher: %v", err)
+			h.log.Error("❌ file watcher", "err", err)
 		}
 	}
 }
@@ -113,6 +122,8 @@ func (h *Hub) Run(ctx context.Context) {
 // call more than once.
 func (h *Hub) Subscribe(ws WatchSet) (notify <-chan struct{}, cancel func()) {
 	sub := &subscriber{
+		id:     h.nextID.Add(1),
+		page:   ws.Page,
 		files:  make(map[string]bool),
 		dirs:   make(map[string]bool),
 		notify: make(chan struct{}, 1),
@@ -158,12 +169,17 @@ func (h *Hub) acquire(folders []string) {
 	for _, d := range folders {
 		h.refs[d]++
 		if h.refs[d] != 1 {
+			h.log.Debug("watch shared", "dir", d, "refs", h.refs[d])
 			continue
 		}
-		if err := h.src.Add(d); err != nil && !h.failed[d] {
-			h.failed[d] = true
-			log.Printf("❌ cannot watch %s, live reload is off for it: %v", d, err)
+		if err := h.src.Add(d); err != nil {
+			if !h.failed[d] {
+				h.failed[d] = true
+				h.log.Warn("❌ cannot watch folder, live reload is off for it", "dir", d, "err", err)
+			}
+			continue
 		}
+		h.log.Debug("watch added", "dir", d, "refs", 1)
 	}
 }
 
@@ -173,55 +189,104 @@ func (h *Hub) release(folders []string) {
 	for _, d := range folders {
 		h.refs[d]--
 		if h.refs[d] > 0 {
+			h.log.Debug("watch released", "dir", d, "refs", h.refs[d])
 			continue
 		}
 		delete(h.refs, d)
 		// Removing a folder whose Add failed reports an error; ignore it.
 		_ = h.src.Remove(d)
+		h.log.Debug("watch removed", "dir", d, "refs", 0)
 	}
 }
 
+// debugging reports whether debug logging is on. Checking it first keeps the
+// disabled hot path to a single branch with no allocation.
+func (h *Hub) debugging() bool {
+	return h.log.Enabled(context.Background(), slog.LevelDebug)
+}
+
 func (h *Hub) handle(ev fsnotify.Event) {
+	debug := h.debugging()
 	// Attribute-only changes (chmod, touch on some systems, indexers) do not
 	// change what a page shows.
 	if ev.Op == fsnotify.Chmod {
+		if debug {
+			h.log.Debug("fs event ignored", "op", ev.Op.String(), "path", ev.Name, "reason", "chmod")
+		}
 		return
 	}
 	name := filepath.Clean(ev.Name)
 	parent := filepath.Dir(name)
 	temp := isTempName(filepath.Base(name))
 
+	// Collected under the lock and logged after releasing it, so a slow
+	// stderr never holds up the hub.
+	var started []*subscriber
+	matched := 0
+
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	for sub := range h.subs {
 		if !sub.files[name] && (temp || !sub.dirs[parent]) {
 			continue
 		}
-		h.schedule(sub)
+		matched++
+		if h.schedule(sub) && debug {
+			started = append(started, sub)
+		}
+	}
+	h.mu.Unlock()
+
+	if !debug {
+		return
+	}
+	switch {
+	case matched > 0:
+		h.log.Debug("fs event", "op", ev.Op.String(), "path", name, "subscribers", matched)
+	case temp:
+		h.log.Debug("fs event ignored", "op", ev.Op.String(), "path", name, "reason", "temp name")
+	default:
+		h.log.Debug("fs event ignored", "op", ev.Op.String(), "path", name, "reason", "no subscriber matched")
+	}
+	for _, sub := range started {
+		h.log.Debug("debounce start", "sub", sub.id, "page", sub.page, "wait", h.debounce)
 	}
 }
 
-// schedule (re)starts sub's debounce timer. The caller holds h.mu.
-func (h *Hub) schedule(sub *subscriber) {
+// schedule (re)starts sub's debounce timer and reports whether this event
+// opened a new debounce window. The caller holds h.mu.
+func (h *Hub) schedule(sub *subscriber) bool {
 	sub.gen++
+	sub.pending++
 	gen := sub.gen
 	if sub.timer != nil {
 		sub.timer.Stop()
 	}
 	sub.timer = time.AfterFunc(h.debounce, func() { h.fire(sub, gen) })
+	return sub.pending == 1
 }
 
 func (h *Hub) fire(sub *subscriber, gen uint64) {
 	h.mu.Lock()
 	_, live := h.subs[sub]
 	current := sub.gen == gen
+	coalesced := 0
+	if current {
+		coalesced = sub.pending
+		sub.pending = 0
+	}
 	h.mu.Unlock()
 	if !live || !current {
 		return
 	}
 	select {
 	case sub.notify <- struct{}{}:
+		if h.debugging() {
+			h.log.Debug("debounce fire", "sub", sub.id, "page", sub.page, "coalesced", coalesced)
+		}
 	default:
+		if h.debugging() {
+			h.log.Debug("notification dropped, one already pending", "sub", sub.id, "page", sub.page, "coalesced", coalesced)
+		}
 	}
 }
 

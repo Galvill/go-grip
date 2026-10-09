@@ -123,6 +123,8 @@ go-grip then serves that folder as the root and opens its folder page. A file ar
 
 Dark mode is not a launch option: use the toggle in the top right corner of the page. Your choice is stored in the browser's local storage, so each browser remembers its own theme. Without a stored choice the page follows the operating system's `prefers-color-scheme` setting.
 
+By default each open page reloads when something it shows changes: a Markdown page when its file or a local image it references is saved, a folder page when an entry in that folder is added, removed, renamed or written. Saving an unrelated file does not reload the page, and editor temp and swap files are ignored.
+
 To disable automatic browser reload on file changes (useful for stable editing):
 
 ```bash

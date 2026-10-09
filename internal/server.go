@@ -2,14 +2,19 @@ package internal
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"html"
+	htmltemplate "html/template"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"text/template"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -91,8 +96,8 @@ func (s *Server) newHandler(fsys http.FileSystem) http.Handler {
 			s.serveMarkdown(w, r, root)
 			return
 		case KindDir:
-			setNoCacheHeaders(w)
-			stripCacheValidators(r)
+			s.serveFolder(w, r, root)
+			return
 		}
 
 		fileServer.ServeHTTP(w, r)
@@ -132,6 +137,74 @@ func (s *Server) serveMarkdown(w http.ResponseWriter, r *http.Request, root *Roo
 	_, _ = w.Write(buf.Bytes())
 }
 
+func (s *Server) serveFolder(w http.ResponseWriter, r *http.Request, root *Root) {
+	dirPath := r.URL.Path
+	if !strings.HasSuffix(dirPath, "/") {
+		// Collapse leading slashes so the redirect can never be read as a
+		// protocol-relative URL to another host.
+		target := url.URL{Path: "/" + strings.TrimLeft(dirPath, "/") + "/", RawQuery: r.URL.RawQuery}
+		http.Redirect(w, r, target.String(), http.StatusMovedPermanently)
+		return
+	}
+
+	setNoCacheHeaders(w)
+	stripCacheValidators(r)
+
+	entries, err := root.List(dirPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			http.NotFound(w, r)
+			return
+		}
+		serverError(w, r, err)
+		return
+	}
+
+	var readme htmltemplate.HTML
+	if name, ok := root.Readme(dirPath); ok {
+		content, err := root.ReadFile(path.Join(dirPath, name))
+		if err != nil {
+			serverError(w, r, err)
+			return
+		}
+		rendered, err := s.parser.MdToHTML(content)
+		if err != nil {
+			serverError(w, r, err)
+			return
+		}
+		// Goldmark output is trusted, as it is for Markdown pages.
+		readme = htmltemplate.HTML(rendered) //nolint:gosec
+	}
+
+	listing, err := renderListing(dirPath, entries, readme, time.Now())
+	if err != nil {
+		serverError(w, r, err)
+		return
+	}
+
+	title := defaultHTMLTitle
+	if dirPath != "/" {
+		title = s.pageTitle(strings.TrimSuffix(dirPath, "/"))
+	}
+
+	var buf bytes.Buffer
+	err = renderTemplate(&buf, htmlStruct{
+		Content:      listing,
+		BoundingBox:  s.boundingBox,
+		CssCodeLight: getCssCode("github"),
+		CssCodeDark:  getCssCode("github-dark"),
+		Title:        html.EscapeString(title),
+		IsListing:    true,
+	})
+	if err != nil {
+		serverError(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	_, _ = w.Write(buf.Bytes())
+}
+
 func serverError(w http.ResponseWriter, r *http.Request, err error) {
 	log.Printf("❌ %s %s: %v", r.Method, r.URL.Path, err)
 	http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -143,6 +216,7 @@ type htmlStruct struct {
 	CssCodeLight string
 	CssCodeDark  string
 	Title        string
+	IsListing    bool
 }
 
 func (s *Server) pageTitle(filename string) string {

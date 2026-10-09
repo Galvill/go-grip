@@ -1,12 +1,14 @@
 package internal
 
 import (
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 )
 
@@ -245,5 +247,269 @@ func TestFilenameTitleResponses(t *testing.T) {
 				t.Fatalf("expected response to contain %q, got %q", tt.want, recorder.Body.String())
 			}
 		})
+	}
+}
+
+func TestFolderPageRedirectsWithoutSlash(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(tmpDir, "sub"), 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(tmpDir))
+
+	tests := []struct {
+		path string
+		want string
+	}{
+		{path: "/sub", want: "/sub/"},
+		{path: "/sub?from=x", want: "/sub/?from=x"},
+	}
+	for _, tt := range tests {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tt.path, nil))
+		if recorder.Code != http.StatusMovedPermanently {
+			t.Fatalf("%s: expected status %d, got %d", tt.path, http.StatusMovedPermanently, recorder.Code)
+		}
+		if got := recorder.Header().Get("Location"); got != tt.want {
+			t.Fatalf("%s: expected Location %q, got %q", tt.path, tt.want, got)
+		}
+	}
+}
+
+func TestFolderPageRendersTemplate(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, "sub", "inner"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for _, name := range []string{"a.md", "sub/b.txt", "<img src=x onerror=alert(1)>.md"} {
+		if err := os.WriteFile(filepath.Join(tmpDir, filepath.FromSlash(name)), []byte("x\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(tmpDir))
+
+	tests := []struct {
+		name    string
+		path    string
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "root",
+			path: "/",
+			want: []string{
+				"<title>" + defaultHTMLTitle + "</title>",
+				`<link rel="stylesheet" href="/static/css/dir-listing.css" />`,
+				`<script src="/static/js/dir-listing.js"></script>`,
+				`<table class="grip-listing">`,
+				`<a href="sub/">sub</a>`,
+				`<a href="a.md">a.md</a>`,
+				`&lt;img src=x onerror=alert(1)&gt;.md`,
+			},
+			notWant: []string{"grip-listing-up", "<img src=x"},
+		},
+		{
+			name: "nested",
+			path: "/sub/",
+			want: []string{
+				"<title>Sub</title>",
+				`<a href="../?from=sub">..</a>`,
+				`<a href="inner/">inner</a>`,
+				`<a href="b.txt">b.txt</a>`,
+			},
+			notWant: []string{"a.md"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tt.path, nil))
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+			}
+			if got := recorder.Header().Get("Content-Type"); got != "text/html" {
+				t.Fatalf("expected text/html, got %q", got)
+			}
+			if got := recorder.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+				t.Fatalf("expected Cache-Control to disable storage, got %q", got)
+			}
+			body := recorder.Body.String()
+			for _, w := range tt.want {
+				if !strings.Contains(body, w) {
+					t.Errorf("body missing %q\n%s", w, body)
+				}
+			}
+			for _, nw := range tt.notWant {
+				if strings.Contains(body, nw) {
+					t.Errorf("body unexpectedly contains %q", nw)
+				}
+			}
+		})
+	}
+}
+
+func TestMarkdownPageDoesNotLoadListingAssets(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "a.md"), []byte("# A\n"), 0o644); err != nil {
+		t.Fatalf("write a.md: %v", err)
+	}
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(tmpDir))
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/a.md", nil))
+	if strings.Contains(recorder.Body.String(), "dir-listing") {
+		t.Fatalf("markdown page must not load listing assets")
+	}
+}
+
+func TestFolderPageRendersReadme(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(tmpDir, "docs"), 0o755); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "docs", "readme.md"), []byte("# Docs Home\n"), 0o644); err != nil {
+		t.Fatalf("write readme.md: %v", err)
+	}
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(tmpDir))
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/docs/", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+	body := recorder.Body.String()
+	table := strings.Index(body, "</table>")
+	article := strings.Index(body, `<article class="grip-listing-readme markdown-body">`)
+	if table < 0 || article < 0 || article < table {
+		t.Fatalf("expected README article after the table, got %q", body)
+	}
+	if !strings.Contains(body[article:], "Docs Home</h1>") {
+		t.Fatalf("expected rendered README, got %q", body[article:])
+	}
+}
+
+// readdirErrorFS opens folders normally but fails to list those under
+// /locked, as a folder without read permission would. A real chmod cannot
+// produce this: on Linux an unreadable folder already fails to open.
+type readdirErrorFS struct{ http.FileSystem }
+
+type readdirErrorFile struct{ http.File }
+
+func (f readdirErrorFile) Readdir(int) ([]fs.FileInfo, error) { return nil, fs.ErrPermission }
+
+func (e readdirErrorFS) Open(name string) (http.File, error) {
+	f, err := e.FileSystem.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(name, "/locked") {
+		return readdirErrorFile{f}, nil
+	}
+	return f, nil
+}
+
+func TestFolderPageListErrorReturns500(t *testing.T) {
+	t.Parallel()
+
+	fsys := readdirErrorFS{http.FS(fstest.MapFS{
+		"a.md":        {Data: []byte("# Fine\n")},
+		"locked/b.md": {Data: []byte("# B\n")},
+		"open/c.txt":  {Data: []byte("c\n")},
+	})}
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(fsys)
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/locked/", nil))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, recorder.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/open/", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected the handler to keep serving with status %d, got %d", http.StatusOK, recorder.Code)
+	}
+}
+
+func TestFolderPageStaysInsideRoot(t *testing.T) {
+	t.Parallel()
+
+	parent := t.TempDir()
+	if err := os.WriteFile(filepath.Join(parent, "outside-secret.md"), []byte("secret\n"), 0o644); err != nil {
+		t.Fatalf("write outside-secret.md: %v", err)
+	}
+	rootDir := filepath.Join(parent, "root")
+	if err := os.Mkdir(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "inside.md"), []byte("# In\n"), 0o644); err != nil {
+		t.Fatalf("write inside.md: %v", err)
+	}
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(rootDir))
+
+	for _, p := range []string{"/%2e%2e/", "/%2e%2e", "/..%2f", "/sub/%2e%2e/%2e%2e/"} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, p, nil))
+		if strings.Contains(recorder.Body.String(), "outside-secret.md") {
+			t.Fatalf("%s: folder page listed an entry outside the root (status %d)", p, recorder.Code)
+		}
+	}
+}
+
+func TestFolderPageListsSymlinkByNameOnly(t *testing.T) {
+	t.Parallel()
+
+	parent := t.TempDir()
+	outside := filepath.Join(parent, "outside")
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "outside-secret.md"), []byte("secret\n"), 0o644); err != nil {
+		t.Fatalf("write outside-secret.md: %v", err)
+	}
+	rootDir := filepath.Join(parent, "root")
+	if err := os.Mkdir(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(rootDir, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(rootDir))
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+	if !strings.Contains(body, ">link</a>") {
+		t.Fatalf("expected the symlink entry in the root listing, got %q", body)
+	}
+	if strings.Contains(body, "outside-secret.md") {
+		t.Fatalf("root listing must not include the symlink target's contents")
 	}
 }

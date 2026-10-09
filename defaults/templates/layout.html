@@ -30,6 +30,10 @@
     <script src="/static/js/tex-mml-chtml.js"></script>
     <script src="/static/js/mermaid.min.js"></script>
     <script src="/static/js/mermaid-init.js"></script>
+    {{if .IsListing}}
+    <link rel="stylesheet" href="/static/css/dir-listing.css" />
+    <script src="/static/js/dir-listing.js"></script>
+    {{end}}
   </head>
 
   <body class="markdown-body">

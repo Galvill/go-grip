@@ -105,13 +105,13 @@ You can also specify a port:
 go-grip -p 80 README.md
 ```
 
-or just open a file-tree with all available files in the current directory:
+or just open the folder page for the current directory:
 
 ```bash
 go-grip
 ```
 
-If a `README.md` exists in that directory it is opened directly, otherwise the file-tree is shown. You can also browse the tree at any time on http://localhost:6419.
+The folder page shows a table of the folder's entries (folders first, with size and modification time) and, if the folder has a `README.md`, renders it below the table, like GitHub does. Every folder you open in the browser gets the same page. Use the arrow keys (or `j`/`k`) to move between rows, Enter to open a file or folder, and Backspace or ← to go up to the parent folder.
 
 To serve another folder, pass it as the argument (with or without a trailing slash):
 
@@ -119,7 +119,7 @@ To serve another folder, pass it as the argument (with or without a trailing sla
 go-grip docs/
 ```
 
-go-grip then serves that folder as the root and opens its file-tree. A file argument serves the file's folder and opens the file. If the given path does not exist, go-grip prints an error and exits with status 1 instead of starting the server.
+go-grip then serves that folder as the root and opens its folder page. A file argument serves the file's folder and opens the file. If the given path does not exist, go-grip prints an error and exits with status 1 instead of starting the server.
 
 Dark mode is not a launch option: use the toggle in the top right corner of the page. Your choice is stored in the browser's local storage, so each browser remembers its own theme. Without a stored choice the page follows the operating system's `prefers-color-scheme` setting.
 

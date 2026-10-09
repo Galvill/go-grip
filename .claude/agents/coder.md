@@ -16,7 +16,7 @@ Every build and test command runs in the FOREGROUND with an explicit `timeout: 6
 
 ## Standing rules
 
-- Read the assigned issue bodies first: `gh issue view <n> -R Galvill/go-grip --json title,body -q '.title, .body'`. They contain verified file:line refs and sketches — follow their spirit; you own the design.
+- Read the assigned issue bodies first: `gh issue view <n> -R Galvill/go-grip --json title,body -q '.title, .body'`. They contain verified file:line refs and sketches — follow their spirit; you own the design. An issue may have a `## Plan` section naming a plan under `.claude/docs/superpowers/plans/` and its spec. If it does, read both from your worktree. The plan is the contract: implement every task's Files, Interfaces, Behavior and Tests exactly as written. Where it differs from the issue's sketch, the plan wins. Its Produces signatures are consumed by later plans, so don't rename them. If the plan can't be followed as written, return `HUMAN-NEEDED`.
 - Every `gh` command that creates or edits something passes `-R Galvill/go-grip`. Never touch `chrishrb/go-grip`.
 - **Never modify anything under `.claude/`.** Fork tooling is out of scope for unit PRs, and a unit diff that touches it can't be upstreamed.
 - Don't add a module dependency the issue doesn't call for. A `go.mod`/`go.sum` change needs `go mod tidy`, and it invalidates `vendorHash` in `flake.nix`, which can't be recomputed here. Say so under `Gate notes`.

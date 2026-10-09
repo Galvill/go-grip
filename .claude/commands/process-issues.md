@@ -80,7 +80,11 @@ gh label create -R Galvill/go-grip blocked-upstream --color c5def5 --description
 gh issue list -R Galvill/go-grip --state open --json number,title,body,labels,createdAt --limit 100
 ```
 
-Filter out any issue with label `human-needed`, `agent-wip`, `design-needed`, `blocked-upstream` or `wontfix`. If the filtered list is empty AND no slots are in flight, go to **Phase 7 — Finalize**.
+Filter out any issue with label `human-needed`, `agent-wip`, `design-needed`, `blocked-upstream` or `wontfix`.
+
+Also hold back any issue whose body has a `Depends on:` line listing an issue `#N` that has not landed yet. `#N` has landed when it is closed, or when its unit PR is in `merged` (on the integration branch). A held issue is neither pooled nor dispatched. It comes back on the Phase 0 pass after its dependency lands. Never pool an issue with one it depends on: dependent issues carry separate plans and become separate upstream PRs. If a held issue's dependency is escalated to `human-needed`, the held issue stays held until the next run.
+
+If the filtered list is empty AND no slots are in flight, go to **Phase 7 — Finalize**. Issues that are only held back don't count as work left. List them under `Escalated` in the final summary as `#<n> (waiting on #N)`.
 
 ## Phase 1 — Cluster (autonomous pooling)
 

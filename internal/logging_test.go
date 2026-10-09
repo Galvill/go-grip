@@ -106,6 +106,30 @@ func TestLoggerLevelFiltering(t *testing.T) {
 	}
 }
 
+func TestLoggerQuotesUnsafeValues(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		in, want string
+	}{
+		{"/plain.md", "/plain.md"},
+		{"/a\nb", `"/a\nb"`},
+		{"/a\x1b[31m", `"/a\x1b[31m"`},
+		{"/\x9b31m", `"/\x9b31m"`}, // invalid UTF-8: a raw C1 CSI byte
+		{"/caf\xc3", `"/caf\xc3"`},
+		{"/café", "/café"},
+	}
+	for _, tt := range tests {
+		var buf bytes.Buffer
+		NewLogger(&buf, slog.LevelInfo).Info("m", "path", tt.in)
+		if got, want := buf.String(), "m path="+tt.want+"\n"; got != want {
+			t.Errorf("path %q: got %q, want %q", tt.in, got, want)
+		}
+		if bytes.IndexByte(buf.Bytes(), 0x9b) >= 0 || bytes.IndexByte(buf.Bytes(), 0x1b) >= 0 {
+			t.Errorf("path %q: raw control byte in output %q", tt.in, buf.String())
+		}
+	}
+}
+
 func TestLoggerAttrsAndGroups(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer

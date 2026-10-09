@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 // LogLevels lists the accepted --log-level values, most to least severe.
@@ -143,8 +144,10 @@ func appendAttr(buf *bytes.Buffer, prefix string, a slog.Attr) {
 }
 
 func quoteIfNeeded(s string) string {
-	if s == "" {
-		return `""`
+	// Invalid UTF-8 ranges as U+FFFD, which IsPrint accepts; quote it so a
+	// raw byte such as 0x9b (C1 CSI) never reaches the terminal.
+	if s == "" || !utf8.ValidString(s) {
+		return strconv.Quote(s)
 	}
 	for _, r := range s {
 		if unicode.IsSpace(r) || r == '"' || r == '=' || !unicode.IsPrint(r) {

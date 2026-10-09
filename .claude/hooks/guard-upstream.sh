@@ -54,8 +54,14 @@ head=$(grep -oE -- '(-H|--head)[= ]+\S+' <<<"$cmd" | head -1 | sed -E 's/^(-H|--
 [ -n "$head" ] || block "upstream PRs must name the head explicitly: --head $FORK_OWNER:<branch>."
 branch=${head#*:}
 
+# The branch comes from command text, so it must not reach git as an option
+# (e.g. --upload-pack=<cmd>). Allow only plain, valid branch names.
+if [[ ! "$branch" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]] || ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
+  block "'$branch' is not a plain branch name; use --head $FORK_OWNER:<branch>."
+fi
+
 git -C "$cwd" fetch -q upstream main 2>/dev/null || block "could not fetch upstream/main to check the diff."
-git -C "$cwd" fetch -q origin "$branch" 2>/dev/null || block "branch '$branch' is not on origin; push it to the fork first."
+git -C "$cwd" fetch -q --end-of-options origin "refs/heads/$branch" 2>/dev/null || block "branch '$branch' is not on origin; push it to the fork first."
 
 leaked=$(git -C "$cwd" diff --name-only upstream/main...FETCH_HEAD | grep -E '^\.claude/' || true)
 if [ -n "$leaked" ]; then

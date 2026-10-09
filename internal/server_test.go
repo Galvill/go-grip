@@ -26,7 +26,7 @@ func TestDirectoryListingIgnoresCacheValidators(t *testing.T) {
 		t.Fatalf("write README.md: %v", err)
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(tmpDir))
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -54,7 +54,7 @@ func TestRegularFileStillSupportsConditionalRequests(t *testing.T) {
 		t.Fatalf("write plain.txt: %v", err)
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(tmpDir))
 
 	req := httptest.NewRequest(http.MethodGet, "/plain.txt", nil)
@@ -76,7 +76,7 @@ func TestMarkdownResponsesDisableCaching(t *testing.T) {
 		t.Fatalf("write README.md: %v", err)
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(tmpDir))
 
 	req := httptest.NewRequest(http.MethodGet, "/README.md", nil)
@@ -114,7 +114,7 @@ func TestHandlerTraversalRejected(t *testing.T) {
 		t.Fatalf("mkdir root: %v", err)
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(rootDir))
 
 	recorder := httptest.NewRecorder()
@@ -125,6 +125,43 @@ func TestHandlerTraversalRejected(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "top secret text") {
 		t.Fatalf("response leaked a file outside the root: %q", recorder.Body.String())
+	}
+}
+
+func TestStaticServesVendoredMathJaxFonts(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
+	handler := server.newHandler(http.Dir(t.TempDir()))
+
+	tests := []struct {
+		path        string
+		contentType string
+		contains    string
+	}{
+		{"/static/fonts/mathjax-newcm-font/chtml/woff2/mjx-ncm-zero.woff2", "font/woff2", "wOF2"},
+		{"/static/fonts/mathjax-newcm-font/chtml/dynamic/double-struck.js", "text/javascript", "MathJaxNewcmFont"},
+	}
+	for _, tt := range tests {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tt.path, nil))
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s: expected status %d, got %d", tt.path, http.StatusOK, recorder.Code)
+		}
+		if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, tt.contentType) {
+			t.Fatalf("%s: expected Content-Type %q, got %q", tt.path, tt.contentType, got)
+		}
+		if !strings.Contains(recorder.Body.String(), tt.contains) {
+			t.Fatalf("%s: expected body to contain %q", tt.path, tt.contains)
+		}
+	}
+
+	// The embedded static tree must not expose anything outside it.
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/static/fonts/%2e%2e/%2e%2e/embed.go", nil))
+	if recorder.Code == http.StatusOK || strings.Contains(recorder.Body.String(), "go:embed") {
+		t.Fatalf("static path escaped the embedded tree: status %d", recorder.Code)
 	}
 }
 
@@ -145,7 +182,7 @@ func TestHandlerReadErrorReturns500(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(locked, 0o644) })
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(tmpDir))
 
 	recorder := httptest.NewRecorder()
@@ -172,7 +209,7 @@ func TestHandlerUppercaseMarkdownExtension(t *testing.T) {
 		t.Fatalf("write B.MD: %v", err)
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(tmpDir))
 
 	recorder := httptest.NewRecorder()
@@ -227,7 +264,7 @@ func TestFilenameTitleResponses(t *testing.T) {
 		}
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(tmpDir))
 
 	tests := []struct {
@@ -264,7 +301,7 @@ func TestFolderPageRedirectsWithoutSlash(t *testing.T) {
 		t.Fatalf("mkdir sub: %v", err)
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(tmpDir))
 
 	tests := []struct {
@@ -299,7 +336,7 @@ func TestFolderPageRendersTemplate(t *testing.T) {
 		}
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(tmpDir))
 
 	tests := []struct {
@@ -371,13 +408,92 @@ func TestMarkdownPageDoesNotLoadListingAssets(t *testing.T) {
 		t.Fatalf("write a.md: %v", err)
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(tmpDir))
 
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/a.md", nil))
 	if strings.Contains(recorder.Body.String(), "dir-listing") {
 		t.Fatalf("markdown page must not load listing assets")
+	}
+}
+
+func TestMarkdownPageLinksBackToFolder(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := writeTree(t, map[string]string{
+		"a.md":       "# A\n",
+		"a/b.md":     "# B\n",
+		"sub/c d.md": "# C\n",
+		"x:y/p:q.md": "# P\n",
+		"q&<x>/f.md": "# F\n",
+	})
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
+	handler := server.newHandler(http.Dir(tmpDir))
+
+	tests := []struct {
+		name      string
+		path      string
+		wantHref  string
+		wantLabel string
+	}{
+		{"root file", "/a.md", `href="/?from=a.md"`, `<span>/</span>`},
+		{"nested file", "/a/b.md", `href="/a/?from=b.md"`, `<span>/a/</span>`},
+		{"space in name", "/sub/c%20d.md", `href="/sub/?from=c+d.md"`, `<span>/sub/</span>`},
+		{"colon in names", "/x%3Ay/p%3Aq.md", `href="/x%3Ay/?from=p%3Aq.md"`, `<span>/x:y/</span>`},
+		{"html in folder name", "/q&%3Cx%3E/f.md", `href="/q&amp;%3Cx%3E/?from=f.md"`, `<span>/q&amp;&lt;x&gt;/</span>`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tt.path, nil))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+			}
+			body := recorder.Body.String()
+			for _, w := range []string{
+				`<a id="grip-back" ` + tt.wantHref,
+				tt.wantLabel,
+				`<link rel="stylesheet" href="/static/css/back-to-folder.css" />`,
+				`<script src="/static/js/back-to-folder.js"></script>`,
+			} {
+				if !strings.Contains(body, w) {
+					t.Errorf("body missing %q\n%s", w, body)
+				}
+			}
+			if strings.Contains(body, "<x>") {
+				t.Errorf("folder name rendered unescaped")
+			}
+			nav := strings.Index(body, `<nav class="grip-back"`)
+			content := strings.Index(body, "<h1")
+			if nav < 0 || content < 0 || nav > content {
+				t.Errorf("expected the back link above the content")
+			}
+		})
+	}
+}
+
+func TestFolderPageHasNoBackLink(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := writeTree(t, map[string]string{
+		"sub/b.md":      "# B\n",
+		"sub/README.md": "# Readme\n",
+	})
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
+	handler := server.newHandler(http.Dir(tmpDir))
+
+	for _, p := range []string{"/", "/sub/"} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, p, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s: expected status %d, got %d", p, http.StatusOK, recorder.Code)
+		}
+		if body := recorder.Body.String(); strings.Contains(body, "grip-back") || strings.Contains(body, "back-to-folder") {
+			t.Errorf("%s: folder page must not render the back link or load its assets", p)
+		}
 	}
 }
 
@@ -392,7 +508,7 @@ func TestFolderPageRendersReadme(t *testing.T) {
 		t.Fatalf("write readme.md: %v", err)
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(tmpDir))
 
 	recorder := httptest.NewRecorder()
@@ -441,7 +557,7 @@ func TestFolderPageListErrorReturns500(t *testing.T) {
 		"open/c.txt":  {Data: []byte("c\n")},
 	})}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(fsys)
 
 	recorder := httptest.NewRecorder()
@@ -472,7 +588,7 @@ func TestFolderPageStaysInsideRoot(t *testing.T) {
 		t.Fatalf("write inside.md: %v", err)
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(rootDir))
 
 	for _, p := range []string{"/%2e%2e/", "/%2e%2e", "/..%2f", "/sub/%2e%2e/%2e%2e/"} {
@@ -503,7 +619,7 @@ func TestFolderPageListsSymlinkByNameOnly(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(rootDir))
 
 	recorder := httptest.NewRecorder()
@@ -541,7 +657,7 @@ func writeTree(t *testing.T, files map[string]string) string {
 func reloadServer(t *testing.T) (*Server, *fakeSource) {
 	t.Helper()
 	hub, src := runHub(t)
-	server := NewServer("localhost", 6419, false, false, true, NewParser())
+	server := NewServer("localhost", 6419, false, false, true, NewParser(), nil)
 	server.hub = hub
 	return server, src
 }
@@ -660,7 +776,7 @@ func TestEventsDisabledWithoutReload(t *testing.T) {
 	t.Parallel()
 
 	dir := writeTree(t, map[string]string{"a.md": "# A\n"})
-	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	server := NewServer("localhost", 6419, false, false, false, NewParser(), nil)
 	handler := server.newHandler(http.Dir(dir))
 
 	recorder := httptest.NewRecorder()
@@ -710,7 +826,7 @@ func TestWatchSetFor(t *testing.T) {
 	})
 	absRoot := filepath.Join(parent, "root")
 	root := NewRoot(http.Dir(absRoot))
-	server := NewServer("localhost", 6419, false, false, true, NewParser())
+	server := NewServer("localhost", 6419, false, false, true, NewParser(), nil)
 	abs := func(parts ...string) string { return filepath.Join(append([]string{absRoot}, parts...)...) }
 
 	tests := []struct {

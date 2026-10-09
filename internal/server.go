@@ -9,7 +9,7 @@ import (
 	htmltemplate "html/template"
 	"io"
 	"io/fs"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
@@ -35,6 +35,7 @@ type Server struct {
 	browser      bool
 	enableReload bool
 	hub          *Hub
+	log          *slog.Logger
 }
 
 // reloadDebounce collapses the several events an editor writes per save into
@@ -50,7 +51,8 @@ func (s *Server) reloading() bool {
 	return s.enableReload && s.hub != nil
 }
 
-func NewServer(host string, port int, boundingBox bool, browser bool, enableReload bool, parser *Parser) *Server {
+// NewServer returns a server. A nil logger discards all output.
+func NewServer(host string, port int, boundingBox bool, browser bool, enableReload bool, parser *Parser, logger *slog.Logger) *Server {
 	return &Server{
 		host:         host,
 		port:         port,
@@ -58,6 +60,7 @@ func NewServer(host string, port int, boundingBox bool, browser bool, enableRelo
 		browser:      browser,
 		enableReload: enableReload,
 		parser:       parser,
+		log:          orDiscard(logger),
 	}
 }
 
@@ -70,10 +73,10 @@ func (s *Server) Serve(file string) error {
 	if s.enableReload {
 		src, err := newFsnotifySource()
 		if err != nil {
-			fmt.Println("❌ Error starting file watcher, auto-reload disabled:", err)
+			s.log.Warn("❌ Error starting file watcher, auto-reload disabled", "err", err)
 			s.enableReload = false
 		} else {
-			s.hub = NewHub(src, reloadDebounce)
+			s.hub = NewHub(src, reloadDebounce, s.log)
 			go s.hub.Run(context.Background())
 		}
 	}
@@ -82,21 +85,89 @@ func (s *Server) Serve(file string) error {
 
 	addr := fmt.Sprintf("http://%s:%d%s", s.host, s.port, startPath)
 
-	fmt.Printf("🚀 Starting server: %s\n", addr)
+	s.log.Info("🚀 Starting server: " + addr)
+	s.log.Debug("serving directory", "dir", directory)
 
 	if s.browser {
 		err := Open(addr)
 		if err != nil {
-			fmt.Println("❌ Error opening browser:", err)
+			s.log.Warn("❌ Error opening browser", "err", err)
 		}
 	}
 
 	if s.reloading() {
-		fmt.Printf("📡 Auto-reload enabled. Files will trigger browser refresh.\n")
+		s.log.Info("📡 Auto-reload enabled. Files will trigger browser refresh.")
 	} else {
-		fmt.Printf("🔄 Auto-reload disabled. Use F5 to manually refresh.\n")
+		s.log.Info("🔄 Auto-reload disabled. Use F5 to manually refresh.")
 	}
 	return http.ListenAndServe(fmt.Sprintf(":%d", s.port), handler)
+}
+
+// debugging reports whether debug logging is on.
+func (s *Server) debugging(ctx context.Context) bool {
+	return s.log.Enabled(ctx, slog.LevelDebug)
+}
+
+// statusRecorder captures the status code and body size of a response. It
+// forwards Flush, which serveEvents needs to stream.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (rec *statusRecorder) WriteHeader(code int) {
+	if rec.status == 0 {
+		rec.status = code
+	}
+	rec.ResponseWriter.WriteHeader(code)
+}
+
+func (rec *statusRecorder) Write(b []byte) (int, error) {
+	if rec.status == 0 {
+		rec.status = http.StatusOK
+	}
+	n, err := rec.ResponseWriter.Write(b)
+	rec.bytes += int64(n)
+	return n, err
+}
+
+func (rec *statusRecorder) Flush() {
+	if rec.status == 0 {
+		rec.status = http.StatusOK
+	}
+	if f, ok := rec.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (rec *statusRecorder) Unwrap() http.ResponseWriter {
+	return rec.ResponseWriter
+}
+
+// logRequests logs each request's method, path, status and duration at
+// debug level, after it completes. With debug off it adds one branch.
+func (s *Server) logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.debugging(r.Context()) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		rec := &statusRecorder{ResponseWriter: w}
+		start := time.Now()
+		next.ServeHTTP(rec, r)
+		status := rec.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		s.log.Debug("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", status,
+			"bytes", rec.bytes,
+			"dur", time.Since(start))
+	})
 }
 
 func (s *Server) newHandler(fsys http.FileSystem) http.Handler {
@@ -131,33 +202,54 @@ func (s *Server) newHandler(fsys http.FileSystem) http.Handler {
 	})
 
 	if !s.reloading() {
-		return mux
+		return s.logRequests(mux)
 	}
 	// While reload is on, make the browser revalidate everything, so a
 	// reload never shows a heuristically cached image or stylesheet.
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return s.logRequests(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache")
 		mux.ServeHTTP(w, r)
-	})
+	}))
 }
 
 // serveEvents streams Server-Sent Events to one page: a "reload" event each
 // time something that page shows has changed. The page names itself in the
 // path query parameter.
 func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, root *Root, absRoot string) {
-	ws, ok := s.watchSetFor(root, absRoot, r.URL.Query().Get("path"))
+	page := r.URL.Query().Get("path")
+	start := time.Now()
+	ws, ok := s.watchSetFor(root, absRoot, page)
 	if !ok {
+		s.log.Warn("live reload request rejected", "page", page)
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		serverError(w, r, errors.New("response writer does not support streaming"))
+		s.serverError(w, r, errors.New("response writer does not support streaming"))
 		return
+	}
+	ws.Page = page
+	debug := s.debugging(r.Context())
+	if debug {
+		s.log.Debug("watch set",
+			"page", page,
+			"files", len(ws.Files),
+			"dirs", len(ws.Dirs),
+			"took", time.Since(start))
 	}
 
 	notify, cancel := s.hub.Subscribe(ws)
 	defer cancel()
+
+	connected := time.Now()
+	reloads := 0
+	if debug {
+		s.log.Debug("sse connect", "page", page)
+		defer func() {
+			s.log.Debug("sse disconnect", "page", page, "reloads", reloads, "dur", time.Since(connected))
+		}()
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -173,9 +265,16 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, root *Root,
 			return
 		case <-notify:
 			if _, err := io.WriteString(w, "event: reload\ndata: 1\n\n"); err != nil {
+				if debug {
+					s.log.Debug("sse reload write failed", "page", page, "err", err)
+				}
 				return
 			}
 			flusher.Flush()
+			reloads++
+			if debug {
+				s.log.Debug("sse reload sent", "page", page)
+			}
 		}
 	}
 }
@@ -265,12 +364,12 @@ func (s *Server) serveMarkdown(w http.ResponseWriter, r *http.Request, root *Roo
 
 	content, err := root.ReadFile(r.URL.Path)
 	if err != nil {
-		serverError(w, r, err)
+		s.serverError(w, r, err)
 		return
 	}
 	htmlContent, err := s.parser.MdToHTML(content)
 	if err != nil {
-		serverError(w, r, err)
+		s.serverError(w, r, err)
 		return
 	}
 
@@ -282,9 +381,11 @@ func (s *Server) serveMarkdown(w http.ResponseWriter, r *http.Request, root *Roo
 		CssCodeDark:  getCssCode("github-dark"),
 		Title:        html.EscapeString(s.pageTitle(r.URL.Path)),
 		Reload:       s.reloading(),
+		BackHref:     html.EscapeString(backHref(r.URL.Path)),
+		BackLabel:    html.EscapeString(backLabel(r.URL.Path)),
 	})
 	if err != nil {
-		serverError(w, r, err)
+		s.serverError(w, r, err)
 		return
 	}
 
@@ -311,7 +412,7 @@ func (s *Server) serveFolder(w http.ResponseWriter, r *http.Request, root *Root)
 			http.NotFound(w, r)
 			return
 		}
-		serverError(w, r, err)
+		s.serverError(w, r, err)
 		return
 	}
 
@@ -319,12 +420,12 @@ func (s *Server) serveFolder(w http.ResponseWriter, r *http.Request, root *Root)
 	if name, ok := root.Readme(dirPath); ok {
 		content, err := root.ReadFile(path.Join(dirPath, name))
 		if err != nil {
-			serverError(w, r, err)
+			s.serverError(w, r, err)
 			return
 		}
 		rendered, err := s.parser.MdToHTML(content)
 		if err != nil {
-			serverError(w, r, err)
+			s.serverError(w, r, err)
 			return
 		}
 		// Goldmark output is trusted, as it is for Markdown pages.
@@ -333,7 +434,7 @@ func (s *Server) serveFolder(w http.ResponseWriter, r *http.Request, root *Root)
 
 	listing, err := renderListing(dirPath, entries, readme, time.Now())
 	if err != nil {
-		serverError(w, r, err)
+		s.serverError(w, r, err)
 		return
 	}
 
@@ -353,7 +454,7 @@ func (s *Server) serveFolder(w http.ResponseWriter, r *http.Request, root *Root)
 		Reload:       s.reloading(),
 	})
 	if err != nil {
-		serverError(w, r, err)
+		s.serverError(w, r, err)
 		return
 	}
 
@@ -361,8 +462,8 @@ func (s *Server) serveFolder(w http.ResponseWriter, r *http.Request, root *Root)
 	_, _ = w.Write(buf.Bytes())
 }
 
-func serverError(w http.ResponseWriter, r *http.Request, err error) {
-	log.Printf("❌ %s %s: %v", r.Method, r.URL.Path, err)
+func (s *Server) serverError(w http.ResponseWriter, r *http.Request, err error) {
+	s.log.Error("❌ request failed", "method", r.Method, "path", r.URL.Path, "err", err)
 	http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 }
 
@@ -374,6 +475,10 @@ type htmlStruct struct {
 	Title        string
 	IsListing    bool
 	Reload       bool
+	// BackHref and BackLabel describe the link from a Markdown page to its
+	// folder. Both are HTML-escaped; they are empty on folder pages.
+	BackHref  string
+	BackLabel string
 }
 
 func (s *Server) pageTitle(filename string) string {

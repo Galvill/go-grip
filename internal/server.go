@@ -7,9 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"path"
-	"regexp"
 	"strings"
 	"text/template"
 	"unicode"
@@ -44,8 +42,10 @@ func NewServer(host string, port int, boundingBox bool, browser bool, enableRelo
 }
 
 func (s *Server) Serve(file string) error {
-	directory := path.Dir(file)
-	filename := path.Base(file)
+	directory, startPath, err := ResolveTarget(file)
+	if err != nil {
+		return err
+	}
 
 	var reloadMiddleware *reload.Reloader
 	if s.enableReload {
@@ -57,24 +57,9 @@ func (s *Server) Serve(file string) error {
 		}
 	}
 
-	dir := http.Dir(directory)
-	handler := s.newHandler(dir)
+	handler := s.newHandler(http.Dir(directory))
 
-	addr := fmt.Sprintf("http://%s:%d/", s.host, s.port)
-	if file == "" {
-		// If README.md exists then open README.md at beginning
-		readme := "README.md"
-		f, err := dir.Open(readme)
-		if err == nil {
-			//nolint:errcheck
-			defer f.Close()
-		}
-		if err == nil {
-			addr, _ = url.JoinPath(addr, readme)
-		}
-	} else {
-		addr, _ = url.JoinPath(addr, filename)
-	}
+	addr := fmt.Sprintf("http://%s:%d%s", s.host, s.port, startPath)
 
 	fmt.Printf("🚀 Starting server: %s\n", addr)
 
@@ -94,46 +79,18 @@ func (s *Server) Serve(file string) error {
 	return http.ListenAndServe(fmt.Sprintf(":%d", s.port), handler)
 }
 
-func (s *Server) newHandler(dir http.Dir) http.Handler {
-	fileServer := http.FileServer(dir)
+func (s *Server) newHandler(fsys http.FileSystem) http.Handler {
+	root := NewRoot(fsys)
+	fileServer := http.FileServer(fsys)
 	mux := http.NewServeMux()
 	mux.Handle("/static/", http.FileServer(http.FS(defaults.StaticFiles)))
 
-	regex := regexp.MustCompile(`(?i)\.md$`)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if regex.MatchString(r.URL.Path) {
-			isFile, err := isRegularFile(dir, r.URL.Path)
-			if err == nil && isFile {
-				setNoCacheHeaders(w)
-
-				bytes, err := readToString(dir, r.URL.Path)
-				if err != nil {
-					log.Fatal(err)
-					return
-				}
-				htmlContent, err := s.parser.MdToHTML(bytes)
-				if err != nil {
-					log.Fatal(err)
-					return
-				}
-
-				err = serveTemplate(w, htmlStruct{
-					Content:      string(htmlContent),
-					BoundingBox:  s.boundingBox,
-					CssCodeLight: getCssCode("github"),
-					CssCodeDark:  getCssCode("github-dark"),
-					Title:        html.EscapeString(s.pageTitle(r.URL.Path)),
-				})
-				if err != nil {
-					log.Fatal(err)
-					return
-				}
-				return
-			}
-		}
-
-		isDirectory, err := isDirectory(dir, r.URL.Path)
-		if err == nil && isDirectory {
+		switch root.Classify(r.URL.Path) {
+		case KindMarkdown:
+			s.serveMarkdown(w, r, root)
+			return
+		case KindDir:
 			setNoCacheHeaders(w)
 			stripCacheValidators(r)
 		}
@@ -144,20 +101,40 @@ func (s *Server) newHandler(dir http.Dir) http.Handler {
 	return mux
 }
 
-func readToString(dir http.Dir, filename string) ([]byte, error) {
-	f, err := dir.Open(filename)
+func (s *Server) serveMarkdown(w http.ResponseWriter, r *http.Request, root *Root) {
+	setNoCacheHeaders(w)
+
+	content, err := root.ReadFile(r.URL.Path)
 	if err != nil {
-		return nil, err
+		serverError(w, r, err)
+		return
 	}
-	//nolint:errcheck
-	defer f.Close()
+	htmlContent, err := s.parser.MdToHTML(content)
+	if err != nil {
+		serverError(w, r, err)
+		return
+	}
 
 	var buf bytes.Buffer
-	_, err = buf.ReadFrom(f)
+	err = renderTemplate(&buf, htmlStruct{
+		Content:      string(htmlContent),
+		BoundingBox:  s.boundingBox,
+		CssCodeLight: getCssCode("github"),
+		CssCodeDark:  getCssCode("github-dark"),
+		Title:        html.EscapeString(s.pageTitle(r.URL.Path)),
+	})
 	if err != nil {
-		return nil, err
+		serverError(w, r, err)
+		return
 	}
-	return buf.Bytes(), nil
+
+	w.Header().Set("Content-Type", "text/html")
+	_, _ = w.Write(buf.Bytes())
+}
+
+func serverError(w http.ResponseWriter, r *http.Request, err error) {
+	log.Printf("❌ %s %s: %v", r.Method, r.URL.Path, err)
+	http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 }
 
 type htmlStruct struct {
@@ -198,14 +175,12 @@ func formatFilenameTitle(filename string) string {
 	return strings.Join(words, " ")
 }
 
-func serveTemplate(w http.ResponseWriter, html htmlStruct) error {
-	w.Header().Set("Content-Type", "text/html")
+func renderTemplate(w io.Writer, html htmlStruct) error {
 	tmpl, err := template.ParseFS(defaults.Templates, "templates/layout.html")
 	if err != nil {
 		return err
 	}
-	err = tmpl.Execute(w, html)
-	return err
+	return tmpl.Execute(w, html)
 }
 
 func getCssCode(style string) string {
@@ -225,36 +200,4 @@ func setNoCacheHeaders(w http.ResponseWriter) {
 func stripCacheValidators(r *http.Request) {
 	r.Header.Del("If-Modified-Since")
 	r.Header.Del("If-None-Match")
-}
-
-func isDirectory(dir http.Dir, name string) (bool, error) {
-	file, err := dir.Open(name)
-	if err != nil {
-		return false, err
-	}
-	//nolint:errcheck
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
-		return false, err
-	}
-
-	return info.IsDir(), nil
-}
-
-func isRegularFile(dir http.Dir, name string) (bool, error) {
-	file, err := dir.Open(name)
-	if err != nil {
-		return false, err
-	}
-	//nolint:errcheck
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
-		return false, err
-	}
-
-	return !info.IsDir(), nil
 }

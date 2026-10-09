@@ -94,6 +94,93 @@ func TestMarkdownResponsesDisableCaching(t *testing.T) {
 	}
 }
 
+func TestHandlerTraversalRejected(t *testing.T) {
+	t.Parallel()
+
+	parent := t.TempDir()
+	if err := os.WriteFile(filepath.Join(parent, "secret.md"), []byte("top secret text\n"), 0o644); err != nil {
+		t.Fatalf("write secret.md: %v", err)
+	}
+	rootDir := filepath.Join(parent, "root")
+	if err := os.Mkdir(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(rootDir))
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/%2e%2e/secret.md", nil))
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d, got %d", http.StatusNotFound, recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "top secret text") {
+		t.Fatalf("response leaked a file outside the root: %q", recorder.Body.String())
+	}
+}
+
+func TestHandlerReadErrorReturns500(t *testing.T) {
+	t.Parallel()
+
+	if os.Getuid() == 0 {
+		t.Skip("root can read files with mode 0o000")
+	}
+
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "a.md"), []byte("# Fine\n"), 0o644); err != nil {
+		t.Fatalf("write a.md: %v", err)
+	}
+	locked := filepath.Join(tmpDir, "locked.md")
+	if err := os.WriteFile(locked, []byte("# Locked\n"), 0o000); err != nil {
+		t.Fatalf("write locked.md: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o644) })
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(tmpDir))
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/locked.md", nil))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, recorder.Code)
+	}
+	if got := strings.TrimSpace(recorder.Body.String()); got != "Internal Server Error" {
+		t.Fatalf("expected body %q, got %q", "Internal Server Error", got)
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/a.md", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected the handler to keep serving with status %d, got %d", http.StatusOK, recorder.Code)
+	}
+}
+
+func TestHandlerUppercaseMarkdownExtension(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "B.MD"), []byte("# Upper Case\n"), 0o644); err != nil {
+		t.Fatalf("write B.MD: %v", err)
+	}
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(tmpDir))
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/B.MD", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/html" {
+		t.Fatalf("expected text/html response, got %q", got)
+	}
+	if !strings.Contains(recorder.Body.String(), "Upper Case</h1>") {
+		t.Fatalf("expected rendered markdown, got %q", recorder.Body.String())
+	}
+}
+
 func TestFormatFilenameTitle(t *testing.T) {
 	t.Parallel()
 

@@ -178,7 +178,7 @@ The script tag comes from `layout.html`. Responses are no longer rewritten.
 - `aarol/reload` and `gorilla/websocket` are removed. `fsnotify` becomes a direct dependency.
 - `go.sum` changes invalidate `vendorHash` in `flake.nix`. No Nix is available here, so the unit's PR says so under Gate notes.
 
-## Project rules
+## Constraints
 
 - Offline: the new JS, CSS and template live under `defaults/` and are embedded via `go:embed`. No CDN and no build step.
 - The module path is unchanged.
@@ -224,13 +224,13 @@ The script tag comes from `layout.html`. Responses are no longer rewritten.
 - Arrow, `j`/`k`, Home/End, Enter and Backspace navigation, including focus returning via `?from`.
 - Live reload on a viewed file. No reload when an unrelated file changes.
 
-## Delivery
+## Delivery plans
 
-Each unit is one PR into the `integration/*` branch.
+Each plan is one unit PR into the `integration/*` branch. Plans live in `.claude/docs/superpowers/plans/`.
 
-1. **Unit A (#3):** `internal/files.go` (`ResolveTarget`, `Root`), the `newHandler` switch, `log.Fatal` replaced by 500. Folders still go to `http.FileServer` in this unit.
-2. **Unit B (#2):** the folder page (`listing.html`, `dir-listing.js`, `dir-listing.css`, README below the table) and the README Usage text. Depends on A.
-3. **Unit C (#1):** `internal/reload.go`, the SSE endpoint, `live-reload.js`, `Parser.LocalRefs`, the dependency swap with its Gate note. Depends on A, and on B for folder-page subscriptions.
+- **A, `2026-10-09-fs-access-a-root-and-routing.md` (#3):** `internal/files.go` (`ResolveTarget`, `Root`), the `newHandler` switch, and 500s instead of `log.Fatal`. Folders still go to `http.FileServer`.
+- **B, `2026-10-09-fs-access-b-folder-view.md` (#2):** the templated folder page, `dir-listing.js`/`.css`, the README below the table, and README Usage. Depends on A.
+- **C, `2026-10-09-fs-access-c-scoped-reload.md` (#1):** the reload hub, the SSE endpoint, `live-reload.js`, `Parser.LocalRefs`, and the dependency swap. Depends on A and B.
 
 ## Out of scope
 

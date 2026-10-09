@@ -128,6 +128,43 @@ func TestHandlerTraversalRejected(t *testing.T) {
 	}
 }
 
+func TestStaticServesVendoredMathJaxFonts(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(t.TempDir()))
+
+	tests := []struct {
+		path        string
+		contentType string
+		contains    string
+	}{
+		{"/static/fonts/mathjax-newcm-font/chtml/woff2/mjx-ncm-zero.woff2", "font/woff2", "wOF2"},
+		{"/static/fonts/mathjax-newcm-font/chtml/dynamic/double-struck.js", "text/javascript", "MathJaxNewcmFont"},
+	}
+	for _, tt := range tests {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tt.path, nil))
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s: expected status %d, got %d", tt.path, http.StatusOK, recorder.Code)
+		}
+		if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, tt.contentType) {
+			t.Fatalf("%s: expected Content-Type %q, got %q", tt.path, tt.contentType, got)
+		}
+		if !strings.Contains(recorder.Body.String(), tt.contains) {
+			t.Fatalf("%s: expected body to contain %q", tt.path, tt.contains)
+		}
+	}
+
+	// The embedded static tree must not expose anything outside it.
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/static/fonts/%2e%2e/%2e%2e/embed.go", nil))
+	if recorder.Code == http.StatusOK || strings.Contains(recorder.Body.String(), "go:embed") {
+		t.Fatalf("static path escaped the embedded tree: status %d", recorder.Code)
+	}
+}
+
 func TestHandlerReadErrorReturns500(t *testing.T) {
 	t.Parallel()
 

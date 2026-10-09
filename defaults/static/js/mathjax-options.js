@@ -1,4 +1,12 @@
 MathJax = {
+  // MathJax resolves its font files (woff2) and the dynamically loaded font
+  // data for less common characters under the [fonts] path, which defaults to
+  // cdn.jsdelivr.net. Point it at the vendored copy so math renders offline.
+  loader: {
+    paths: {
+      fonts: '/static/fonts',
+    },
+  },
   options: {
     a11y: {
       backgroundOpacity: 0,

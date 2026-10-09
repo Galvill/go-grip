@@ -1,15 +1,21 @@
 package internal
 
 import (
+	"bufio"
+	"context"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func TestDirectoryListingIgnoresCacheValidators(t *testing.T) {
@@ -511,5 +517,227 @@ func TestFolderPageListsSymlinkByNameOnly(t *testing.T) {
 	}
 	if strings.Contains(body, "outside-secret.md") {
 		t.Fatalf("root listing must not include the symlink target's contents")
+	}
+}
+
+// writeTree creates files (slash-separated paths) under a new temp folder.
+func writeTree(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, content := range files {
+		p := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir for %s: %v", name, err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	return dir
+}
+
+// reloadServer returns a server with live reload on, backed by a hub on a
+// fake event source.
+func reloadServer(t *testing.T) (*Server, *fakeSource) {
+	t.Helper()
+	hub, src := runHub(t)
+	server := NewServer("localhost", 6419, false, false, true, NewParser())
+	server.hub = hub
+	return server, src
+}
+
+func TestEventsStreamsReload(t *testing.T) {
+	t.Parallel()
+
+	dir := writeTree(t, map[string]string{"docs/a.md": "# A\n"})
+	server, src := reloadServer(t)
+	ts := httptest.NewServer(server.newHandler(http.Dir(dir)))
+	defer ts.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/__grip/events?path="+url.QueryEscape("/docs/a.md"), nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("get events: %v", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("expected text/event-stream, got %q", got)
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	line, err := reader.ReadString('\n')
+	if err != nil || line != ": connected\n" {
+		t.Fatalf("expected the connected comment first, got %q (%v)", line, err)
+	}
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("read blank line: %v", err)
+	}
+
+	// An unrelated file in the same folder must not reload the page.
+	src.events <- fsnotify.Event{Name: filepath.Join(dir, "docs", "b.md"), Op: fsnotify.Write}
+	src.events <- fsnotify.Event{Name: filepath.Join(dir, "docs", "a.md"), Op: fsnotify.Write}
+
+	got := make(chan string, 1)
+	go func() {
+		var buf strings.Builder
+		for range 2 {
+			l, err := reader.ReadString('\n')
+			if err != nil {
+				break
+			}
+			buf.WriteString(l)
+		}
+		got <- buf.String()
+	}()
+	select {
+	case s := <-got:
+		if s != "event: reload\ndata: 1\n" {
+			t.Fatalf("expected a reload event, got %q", s)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the reload event")
+	}
+
+	// Disconnecting releases the folder watch.
+	cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, removed := src.calls()
+		if len(removed) == 1 && removed[0] == filepath.Join(dir, "docs") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected the docs folder watch to be released, removed %q", removed)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestEventsRejectsBadPath(t *testing.T) {
+	t.Parallel()
+
+	parent := writeTree(t, map[string]string{
+		"x.md":           "outside\n",
+		"root/a.md":      "# A\n",
+		"root/notes.txt": "plain\n",
+	})
+	server, _ := reloadServer(t)
+	handler := server.newHandler(http.Dir(filepath.Join(parent, "root")))
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"encoded traversal", "?path=/%2e%2e/x.md"},
+		{"plain traversal", "?path=/../x.md"},
+		{"inner traversal", "?path=/sub/../a.md"},
+		{"missing parameter", ""},
+		{"relative path", "?path=a.md"},
+		{"not found", "?path=/nope.md"},
+		{"not markdown", "?path=/notes.txt"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/__grip/events"+tt.query, nil))
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestEventsDisabledWithoutReload(t *testing.T) {
+	t.Parallel()
+
+	dir := writeTree(t, map[string]string{"a.md": "# A\n"})
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(dir))
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/__grip/events?path=/a.md", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d, got %d", http.StatusNotFound, recorder.Code)
+	}
+
+	for _, page := range []string{"/a.md", "/"} {
+		recorder = httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, page, nil))
+		if strings.Contains(recorder.Body.String(), "live-reload.js") {
+			t.Fatalf("%s: reload script must not load with --no-reload", page)
+		}
+	}
+}
+
+func TestReloadPagesLoadScriptAndDisableCaching(t *testing.T) {
+	t.Parallel()
+
+	dir := writeTree(t, map[string]string{"a.md": "# A\n", "img.png": "png"})
+	server, _ := reloadServer(t)
+	handler := server.newHandler(http.Dir(dir))
+
+	for _, page := range []string{"/a.md", "/"} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, page, nil))
+		if !strings.Contains(recorder.Body.String(), `<script src="/static/js/live-reload.js"></script>`) {
+			t.Fatalf("%s: expected the reload script tag", page)
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/img.png", nil))
+	if got := recorder.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("expected Cache-Control no-cache on other files, got %q", got)
+	}
+}
+
+func TestWatchSetFor(t *testing.T) {
+	t.Parallel()
+
+	parent := writeTree(t, map[string]string{
+		"root/docs/a.md":      "# A\n\n![x](img/x.png) ![w](https://example.com/w.png)\n",
+		"root/docs/README.md": "![r](r.png)\n",
+		"root/docs/esc.md":    "![e](../../outside.png) ![ok](../top.png) ![abs](/abs.png)\n",
+	})
+	absRoot := filepath.Join(parent, "root")
+	root := NewRoot(http.Dir(absRoot))
+	server := NewServer("localhost", 6419, false, false, true, NewParser())
+	abs := func(parts ...string) string { return filepath.Join(append([]string{absRoot}, parts...)...) }
+
+	tests := []struct {
+		name string
+		path string
+		want WatchSet
+	}{
+		{"markdown with image", "/docs/a.md", WatchSet{
+			Files: []string{abs("docs", "a.md"), abs("docs", "img", "x.png")},
+		}},
+		{"folder with readme", "/docs/", WatchSet{
+			Files: []string{abs("docs", "r.png")},
+			Dirs:  []string{abs("docs")},
+		}},
+		{"ref escaping root is dropped", "/docs/esc.md", WatchSet{
+			Files: []string{abs("docs", "esc.md"), abs("top.png"), abs("abs.png")},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := server.watchSetFor(root, absRoot, tt.path)
+			if !ok {
+				t.Fatalf("watchSetFor(%q) rejected the path", tt.path)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("watchSetFor(%q) = %+v, want %+v", tt.path, got, tt.want)
+			}
+		})
 	}
 }

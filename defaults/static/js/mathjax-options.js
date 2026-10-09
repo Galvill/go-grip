@@ -6,6 +6,35 @@ MathJax = {
     paths: {
       fonts: '/static/fonts',
     },
+    // github.com renders math with these TeX packages enabled up front. The
+    // bundle autoloads most of them on first use from the vendored
+    // static/js/input/tex/extensions/, but these define macros it cannot
+    // autoload (\coloneqq, \upalpha, \degree, \centernot, ...), so load
+    // them with the page, as GitHub does.
+    load: [
+      '[tex]/cases',
+      '[tex]/centernot',
+      '[tex]/empheq',
+      '[tex]/gensymb',
+      '[tex]/mathtools',
+      '[tex]/textcomp',
+      '[tex]/upgreek',
+    ],
+  },
+  tex: {
+    packages: {
+      '[+]': ['cases', 'centernot', 'empheq', 'gensymb', 'mathtools', 'textcomp', 'upgreek'],
+    },
+    require: {
+      // These extensions need font extensions that are not vendored, so
+      // \require{...} would fail to load their fonts. GitHub does not
+      // support them either.
+      allow: {
+        bbm: false,
+        bboldx: false,
+        dsfont: false,
+      },
+    },
   },
   options: {
     a11y: {

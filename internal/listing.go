@@ -85,6 +85,34 @@ func upHref(dirPath string) string {
 	return "../?from=" + url.QueryEscape(path.Base(trimmed))
 }
 
+// backHref is the absolute link from the file at urlPath to its containing
+// folder. It carries the file name in ?from= so the folder page focuses the
+// row of the file just left. Each folder segment is escaped like entryHref.
+func backHref(urlPath string) string {
+	dir, name := path.Split(path.Clean("/" + urlPath))
+	var b strings.Builder
+	for _, seg := range strings.Split(strings.Trim(dir, "/"), "/") {
+		if seg == "" {
+			continue
+		}
+		b.WriteString("/")
+		b.WriteString(entryHref(seg, false))
+	}
+	b.WriteString("/?from=")
+	b.WriteString(url.QueryEscape(name))
+	return b.String()
+}
+
+// backLabel is the folder containing the file at urlPath, written as the
+// folder view's path heading shows it, e.g. "/docs/".
+func backLabel(urlPath string) string {
+	dir := path.Dir(path.Clean("/" + urlPath))
+	if dir == "/" {
+		return dir
+	}
+	return dir + "/"
+}
+
 // formatSize renders a byte count in base 1024 units.
 func formatSize(n int64) string {
 	const unit = 1024

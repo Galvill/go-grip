@@ -418,6 +418,85 @@ func TestMarkdownPageDoesNotLoadListingAssets(t *testing.T) {
 	}
 }
 
+func TestMarkdownPageLinksBackToFolder(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := writeTree(t, map[string]string{
+		"a.md":       "# A\n",
+		"a/b.md":     "# B\n",
+		"sub/c d.md": "# C\n",
+		"x:y/p:q.md": "# P\n",
+		"q&<x>/f.md": "# F\n",
+	})
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(tmpDir))
+
+	tests := []struct {
+		name      string
+		path      string
+		wantHref  string
+		wantLabel string
+	}{
+		{"root file", "/a.md", `href="/?from=a.md"`, `<span>/</span>`},
+		{"nested file", "/a/b.md", `href="/a/?from=b.md"`, `<span>/a/</span>`},
+		{"space in name", "/sub/c%20d.md", `href="/sub/?from=c+d.md"`, `<span>/sub/</span>`},
+		{"colon in names", "/x%3Ay/p%3Aq.md", `href="/x%3Ay/?from=p%3Aq.md"`, `<span>/x:y/</span>`},
+		{"html in folder name", "/q&%3Cx%3E/f.md", `href="/q&amp;%3Cx%3E/?from=f.md"`, `<span>/q&amp;&lt;x&gt;/</span>`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tt.path, nil))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+			}
+			body := recorder.Body.String()
+			for _, w := range []string{
+				`<a id="grip-back" ` + tt.wantHref,
+				tt.wantLabel,
+				`<link rel="stylesheet" href="/static/css/back-to-folder.css" />`,
+				`<script src="/static/js/back-to-folder.js"></script>`,
+			} {
+				if !strings.Contains(body, w) {
+					t.Errorf("body missing %q\n%s", w, body)
+				}
+			}
+			if strings.Contains(body, "<x>") {
+				t.Errorf("folder name rendered unescaped")
+			}
+			nav := strings.Index(body, `<nav class="grip-back"`)
+			content := strings.Index(body, "<h1")
+			if nav < 0 || content < 0 || nav > content {
+				t.Errorf("expected the back link above the content")
+			}
+		})
+	}
+}
+
+func TestFolderPageHasNoBackLink(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := writeTree(t, map[string]string{
+		"sub/b.md":      "# B\n",
+		"sub/README.md": "# Readme\n",
+	})
+
+	server := NewServer("localhost", 6419, false, false, false, NewParser())
+	handler := server.newHandler(http.Dir(tmpDir))
+
+	for _, p := range []string{"/", "/sub/"} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, p, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s: expected status %d, got %d", p, http.StatusOK, recorder.Code)
+		}
+		if body := recorder.Body.String(); strings.Contains(body, "grip-back") || strings.Contains(body, "back-to-folder") {
+			t.Errorf("%s: folder page must not render the back link or load its assets", p)
+		}
+	}
+}
+
 func TestFolderPageRendersReadme(t *testing.T) {
 	t.Parallel()
 

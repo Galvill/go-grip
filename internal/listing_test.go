@@ -105,6 +105,34 @@ func TestRenderListingSchemeLikeName(t *testing.T) {
 	}
 }
 
+func TestBackHrefAndLabel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		urlPath   string
+		wantHref  string
+		wantLabel string
+	}{
+		{"/a.md", "/?from=a.md", "/"},
+		{"/a/b.md", "/a/?from=b.md", "/a/"},
+		{"/sub/c d.md", "/sub/?from=c+d.md", "/sub/"},
+		{"/x:y/p:q.md", "/x%3Ay/?from=p%3Aq.md", "/x:y/"},
+		{"/a&b/c?d#e.md", "/a&b/?from=c%3Fd%23e.md", "/a&b/"},
+		{"/a/b/c.md", "/a/b/?from=c.md", "/a/b/"},
+		// A path can never point above the served root.
+		{"/../../x.md", "/?from=x.md", "/"},
+		{"//a//b.md", "/a/?from=b.md", "/a/"},
+	}
+	for _, tt := range tests {
+		if got := backHref(tt.urlPath); got != tt.wantHref {
+			t.Errorf("backHref(%q) = %q, want %q", tt.urlPath, got, tt.wantHref)
+		}
+		if got := backLabel(tt.urlPath); got != tt.wantLabel {
+			t.Errorf("backLabel(%q) = %q, want %q", tt.urlPath, got, tt.wantLabel)
+		}
+	}
+}
+
 func TestFormatSize(t *testing.T) {
 	t.Parallel()
 

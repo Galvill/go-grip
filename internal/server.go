@@ -282,6 +282,8 @@ func (s *Server) serveMarkdown(w http.ResponseWriter, r *http.Request, root *Roo
 		CssCodeDark:  getCssCode("github-dark"),
 		Title:        html.EscapeString(s.pageTitle(r.URL.Path)),
 		Reload:       s.reloading(),
+		BackHref:     html.EscapeString(backHref(r.URL.Path)),
+		BackLabel:    html.EscapeString(backLabel(r.URL.Path)),
 	})
 	if err != nil {
 		serverError(w, r, err)
@@ -374,6 +376,10 @@ type htmlStruct struct {
 	Title        string
 	IsListing    bool
 	Reload       bool
+	// BackHref and BackLabel describe the link from a Markdown page to its
+	// folder. Both are HTML-escaped; they are empty on folder pages.
+	BackHref  string
+	BackLabel string
 }
 
 func (s *Server) pageTitle(filename string) string {
